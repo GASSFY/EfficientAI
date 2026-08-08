@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# MAS-Quant regenerable / local artifacts
+masquant/cache/
+masquant/act_scales/
+masquant/act_shifts/
+masquant/outputs/
+masquant/outputs_vl/
+masquant/logs/
+masquant/grad_info/
+masquant/white_matrix/
+masquant/low_rank_adapters/
+
+# Local env / IDE
+.env
+.venv/
+venv/
+*.pt
+*.pth
+*.cache
+.DS_Store
+.idea/
+.vscode/

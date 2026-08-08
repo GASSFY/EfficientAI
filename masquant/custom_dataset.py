@@ -91,11 +91,11 @@ def prepare_dataset(n_sample: int = 8, data_type: str = 'text-vision') -> list[l
                 conversations.append(dataset["prompt"])
         return conversations[:n_sample]
     elif data_type == 'text-vision':
-        dataset_json = '/nas/yuehu/NEW/qwen_compressor/dataset/sharegpt4v_instruct_gpt4-vision_cap100k_filtered_coco_image.json'
+        dataset_json = '/root/autodl-tmp/hf_home/datasets/coco/sharegpt4v_coco_only.json'
         with open(dataset_json, "r") as json_file:
             dataset = json.load(json_file)
             
-        prefix_path = "file:///nas/yuehu/assets/dataset/"
+        prefix_path = "/root/autodl-tmp/hf_home/datasets/"
 
         dataset_ret = []
         for i in range(n_sample):

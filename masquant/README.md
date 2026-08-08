@@ -30,6 +30,7 @@
 - [Supported Models](#supported-models)
 - [Usage](#usage)
 - [Examples](#examples)
+- [Local Artifacts](ARTIFACTS.md)
 - [Citation](#citation)
 - [Acknowledgments](#acknowledgments)
 - [License](#license)
@@ -56,6 +57,17 @@ pip install lmms-eval
 ```
 
 ## 🚀 Quick Start
+
+**Local artifacts** (`act_scales/`, `cache/`, `outputs/`, `logs/`): see [ARTIFACTS.md](ARTIFACTS.md). These paths are gitignored; only small scale checkpoints (`mas_parameters.pth`) are kept locally after training—there is no large fake-quantized model dump by default.
+
+**Helper scripts:**
+
+- [`exp.sh`](exp.sh) — edit `TASKS` / `RESUME` / bitwidth for a single train or eval run.
+- [`run_overnight.sh`](run_overnight.sh) — train missing configs then evaluate; `SMOKE=1 bash run_overnight.sh` for a 2-sample probe; full overnight without `SMOKE`.
+
+**Eval generation length:** `--gen_max_new_tokens` (default `16`). Use `16` for MMMU / RealWorldQA / AI2D; use `128` for OCRBench.
+
+**Recorded Qwen2.5-VL-7B scores:** [experiments/qwen25_vl_7b_results.md](experiments/qwen25_vl_7b_results.md).
 
 ### For Qwen2.5-VL (Text + Vision)
 

@@ -4,6 +4,7 @@
 # torch.use_deterministic_algorithms(True)
 # import torch
 # torch.autograd.set_detect_anomaly(True)
+import argparse
 
 # import os
 # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -499,7 +500,11 @@ def evaluate(llm, args, logger):
                 tasks=args.tasks_multimodal.split(","),
                 num_fewshot=args.num_fewshot,
                 limit=None if args.limit_multimodal == 1.0 else args.limit_multimodal,
-                gen_kwargs="max_new_tokens=128"
+                gen_kwargs=f"max_new_tokens={args.gen_max_new_tokens}",
+                cli_args=argparse.Namespace(
+                    output_path=args.output_dir,
+                    process_with_media=False,
+                ),
             )
             results.update(t_results['results'])
             logger.info(results)
@@ -527,6 +532,12 @@ def main_entry(args=None):
     parser.add_argument("--seed", type=int, default=2, help="Seed for sampling the calibration data.")
     parser.add_argument("--tasks", default="")
     parser.add_argument("--tasks_multimodal", default="")
+    parser.add_argument(
+        "--gen_max_new_tokens",
+        type=int,
+        default=16,
+        help="max_new_tokens for multimodal lmms-eval generation (OCRBench typically needs 128)",
+    )
     parser.add_argument("--eval_ppl", action="store_true")
     parser.add_argument("--auto_scale", action="store_true")
     parser.add_argument("--auto_alpha", action="store_true")
