@@ -38,10 +38,23 @@ class LMClass(BaseLM):
         self.batch_size_per_gpu = args.batch_size
 
         self.model_config = args.model
-        config = AutoConfig.from_pretrained(
-            args.model, attn_implementation=args.attn_implementation, trust_remote_code=True
+        model_key = args.model.lower()
+        is_llava_ov = ("llava-onevision" in model_key) or ("llava_onevision" in model_key) or (
+            "onevision" in model_key and "llava" in model_key
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False,legacy=False, trust_remote_code=True)
+        is_internvl = "internvl" in model_key
+
+        if is_llava_ov:
+            # LLaVA-NeXT builder owns config/tokenizer loading
+            config = None
+            self.tokenizer = None
+        else:
+            config = AutoConfig.from_pretrained(
+                args.model, attn_implementation=args.attn_implementation, trust_remote_code=True
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                args.model, use_fast=False, legacy=False, trust_remote_code=True
+            )
         # 注意，我们只使用 omni 的 thinker 模块
         if 'Qwen2.5-Omni' in args.model:
             # from transformers import Qwen2_5OmniForConditionalGeneration
@@ -79,7 +92,54 @@ class LMClass(BaseLM):
             self.model_config_origin = model.config            
             self.model = model.llm
             processor = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-            print(f'we will use minicpm llm model only.')            
+            print(f'we will use minicpm llm model only.')
+        elif is_internvl:
+            import copy
+            kwargs = {
+                "torch_dtype": torch.bfloat16,
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": True,
+            }
+            model = AutoModel.from_pretrained(args.model, **kwargs)
+            model = model.eval().cuda()
+            from models.LMMClass_InternVL import _patch_internlm_generate
+            _patch_internlm_generate(model)
+            if getattr(args, "eval_sqnr", False):
+                self.model_origin = copy.deepcopy(model)
+            else:
+                self.model_origin = model
+            self.model_config_origin = model.config
+            self.model = model  # full InternVLChatModel
+            self.seqlen = getattr(model.language_model.config, "max_position_embeddings", 4096)
+            print("loaded InternVL2 full model for MAS-Quant")
+        elif is_llava_ov:
+            import copy
+            from llava.mm_utils import get_model_name_from_path
+            from llava.model.builder import load_pretrained_model
+
+            model_name = get_model_name_from_path(args.model)
+            # Avoid accelerate device_map hooks (they break per-layer .cpu()/.to(cuda) in MAS).
+            tokenizer, model, image_processor, _max_length = load_pretrained_model(
+                args.model,
+                None,
+                model_name,
+                device_map=None,
+                multimodal=True,
+                attn_implementation=getattr(args, "attn_implementation", None) or "sdpa",
+            )
+            model = model.to(self._device)
+            self.tokenizer = tokenizer
+            self.image_processor = image_processor
+            if getattr(args, "eval_sqnr", False):
+                self.model_origin = copy.deepcopy(model)
+            else:
+                self.model_origin = model
+            self.model_config_origin = model.config
+            self.model = model  # full LlavaQwenForCausalLM
+            self.seqlen = getattr(model.config, "tokenizer_model_max_length", None) or getattr(
+                model.config, "max_position_embeddings", 4096
+            )
+            print("loaded LLaVA-OneVision full model for MAS-Quant")
         else:
             self.model = AutoModelForCausalLM.from_pretrained(args.model, config=config, device_map='cpu',torch_dtype=torch.float16)
             self.seqlen = self.model.config.max_position_embeddings

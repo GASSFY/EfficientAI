@@ -42,9 +42,10 @@ class QuantLinear(nn.Module):
         self.fwd_func = F.linear
         self.name = name
         self.layer_index = layer_index
-        self.register_buffer('weight', org_module.weight)
+        # Clone so later ori_layer.cpu() cannot yank QuantLinear weights off device.
+        self.register_buffer('weight', org_module.weight.detach().clone())
         if org_module.bias is not None:
-            self.register_buffer('bias', org_module.bias)
+            self.register_buffer('bias', org_module.bias.detach().clone())
         else:
             self.bias = None
         self.in_features = org_module.in_features
@@ -87,14 +88,22 @@ class QuantLinear(nn.Module):
         self.mode = mode
 
     def get_masked_value(self, mask_value, input_tensor):
-        # 检查形状
-        if mask_value is None or mask_value.shape != input_tensor.shape:
-            # 使用 torch.zeros_like 创建一个与 input_tensor 相同形状的零张量
-            print(f'do not support !!!!')
-            import pdb;
-            pdb.set_trace()
-
-        # 使用 torch.where 进行掩码选择
+        if mask_value is None:
+            return torch.zeros_like(input_tensor)
+        mask_value = mask_value.to(device=input_tensor.device)
+        # Modality masks are per-token. Broadcast last dim for:
+        # - [B, S, 1] -> [B, S, H]
+        # - [B, S, hidden] -> [B, S, intermediate] (e.g. InternVL MLP w2)
+        if mask_value.shape != input_tensor.shape:
+            if (
+                mask_value.dim() == input_tensor.dim()
+                and mask_value.shape[:-1] == input_tensor.shape[:-1]
+            ):
+                mask_value = mask_value[..., :1].expand_as(input_tensor)
+            else:
+                raise RuntimeError(
+                    f"mask/input shape mismatch: {tuple(mask_value.shape)} vs {tuple(input_tensor.shape)}"
+                )
         return torch.where(mask_value, input_tensor, torch.zeros_like(input_tensor))
 
     def find_different_indices(self, tensor1, tensor2):
@@ -114,13 +123,6 @@ class QuantLinear(nn.Module):
         cur_dtype = input.dtype
         target_dtype = torch.bfloat16
         inference_mode = self.inference_mode
-        scale_dtype = self.vision_smooth_scale.dtype
-        weight_dtype = self.weight.dtype
-
-        if cur_dtype != target_dtype or cur_dtype != scale_dtype or cur_dtype != weight_dtype:
-            print(f'data type is invalid')
-        # if self.layer_index == 0:
-        #     inference_mode = 'split_scales'
 
         # 只有是在 prefill 阶段，才有 mask 信息，所以在 decode 阶段，就按照是文本输出的方式来进行计算。
         if multi_modal_mask is not None and input.shape[1] != 1:
@@ -149,13 +151,6 @@ class QuantLinear(nn.Module):
             dtype=self.vision_smooth_scale.dtype,
             device=self.vision_smooth_scale.device
         )
-        # with torch.no_grad():
-        #     if inference_mode == 'merged_scales':
-        #         self.all_in_one_smooth_scale.data.add_(epsilon)
-        #     else:
-        #         self.vision_smooth_scale.data.add_(epsilon)
-        #         self.audio_smooth_scale.data.add_(epsilon)
-        #         self.text_smooth_scale.data.add_(epsilon)
 
         # 统一scale
         if inference_mode == 'merged_scales':
@@ -164,7 +159,6 @@ class QuantLinear(nn.Module):
                     (self.weight.to(target_dtype) * self.all_in_one_smooth_scale).to(cur_dtype))
             else:
                 weight_scaled = self.weight
-            bias = self.bias
 
             if self.use_act_quant and not self.disable_input_quant:
                 input_scaled = self.act_quantizer((input.to(target_dtype) / self.all_in_one_smooth_scale).to(cur_dtype))
@@ -174,13 +168,9 @@ class QuantLinear(nn.Module):
             out = self.fwd_func(input_scaled, weight_scaled,
                                 bias=self.bias.to(cur_dtype) if self.bias is not None else None)
             out = out.to(cur_dtype)
-            # if not math.isfinite(self.all_in_one_smooth_scale[0].item()):
-            #     import pdb; pdb.set_trace()
 
-        # 分模态scale
+        # 分模态scale（恢复为过夜 InternVL 成功时的并行路径；不做 ±1e4 / abs 强制）
         else:
-            # self.audio_smooth_scale = self.text_smooth_scale
-            # self.vision_smooth_scale = self.text_smooth_scale
             if self.use_weight_quant:
                 weight_audio = self.weight_quantizer(
                     (self.weight.to(target_dtype) * self.audio_smooth_scale).to(cur_dtype))
@@ -214,15 +204,7 @@ class QuantLinear(nn.Module):
             out_vision = self.fwd_func(input_vision, weight_vision, bias=None)
             out_text = self.fwd_func(input_text, weight_text,
                                      bias=self.bias.to(cur_dtype) if self.bias is not None else None)
-            # if input_vision.mean().item() <= 0.0000001:
-            # import pdb;pdb.set_trace()
-            # print(f'layer_{self.layer_index}, name: {self.name}, text_smooth_scale: {self.text_smooth_scale.mean()}, audio_smooth_scale: {self.audio_smooth_scale.mean()}, vision_smooth_scale: {self.vision_smooth_scale.mean()}')
-            # print(f'layer_{self.layer_index}, name: {self.name}, out_text: {out_text.mean()}, out_audio: {out_audio.mean()}, out_vision: {out_vision.mean()}')
             out = out_text + out_vision + out_audio
-            if torch.isnan(out_vision).any() or torch.isnan(out_text).any() or torch.isnan(out_audio).any():
-                import pdb;
-                pdb.set_trace()
-
             out = out.to(cur_dtype)
 
         return out

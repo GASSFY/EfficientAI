@@ -1,44 +1,42 @@
-# coding=utf-8 
-# Copyright (c) 2025, Alibaba Cloud and its affiliates;
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#   http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# coding=utf-8
 import torch
 from quantize.int_linear import QuantLinear
+
 
 def mas_quantize_model(
         model, low_rank_adapters, text_scales, vision_scales, audio_scales, args
 ):
-    dev = 'cuda'
-    if "omni" in args.model.lower():
+    dev = "cuda"
+    model_key = args.model.lower()
+    if "omni" in model_key:
         layers = model.model.layers
-        from models.int_qwen_omni_layer import QuantQwenDecoderLayerV2
+        from models.int_qwen_omni_layer import QuantQwenDecoderLayerV2 as DecoderLayer
+        cfg = model.config.text_config
+    elif "internvl" in model_key:
+        layers = model.language_model.model.layers
+        from models.int_internvl_layer import QuantInternVLDecoderLayerV2 as DecoderLayer
+        cfg = model.language_model.config
+    elif ("llava-onevision" in model_key) or ("llava_onevision" in model_key) or (
+        "onevision" in model_key and "llava" in model_key
+    ):
+        layers = model.model.layers
+        from models.int_minicpm_layer import QuantMiniCPMDecoderLayerV2 as DecoderLayer
+        cfg = model.config
     else:
         layers = model.model.language_model.layers
-        from models.int_qwen_vl_layer import QuantQwenDecoderLayerV2
+        from models.int_qwen_vl_layer import QuantQwenDecoderLayerV2 as DecoderLayer
+        cfg = model.config
 
     for i in range(len(layers)):
         layer = layers[i].to(dev)
         print(f"=== Start quantize layer {i} ===")
-        if "omni" in args.model.lower():
-            qlayer = QuantQwenDecoderLayerV2(model.config.text_config, layer, args, layer_idx=i)
-        else:
-            qlayer = QuantQwenDecoderLayerV2(model.config, layer, args, layer_idx=i) #vl模型
+        qlayer = DecoderLayer(cfg, layer, args, layer_idx=i)
         qlayer = qlayer.to(dev)
         qlayer.set_quant_state(weight_quant=True, act_quant=True)
         layers[i] = qlayer
-    filter_modules = ['visual', 'lm_head', 'audio']
+
+    filter_modules = ["visual", "vision", "lm_head", "audio", "vision_tower", "mm_projector", "mlp1"]
     for name, m in model.named_modules():
-        #复制低秩分支
         if isinstance(m, QuantLinear) and not any(f in name for f in filter_modules):
             if args.rank > 0 and name in low_rank_adapters["vision"].keys():
                 m.Lv = low_rank_adapters["vision"][name]["L"].to(m.weight.dtype)
@@ -55,5 +53,6 @@ def mas_quantize_model(
             target_dtype = torch.bfloat16
             cur_dtype = m.weight.dtype
             m.q_weight = m.weight_quantizer(
-                (m.weight.to(target_dtype) * m.text_smooth_scale).to(cur_dtype)) #real quant
+                (m.weight.to(target_dtype) * m.text_smooth_scale).to(cur_dtype)
+            )
     return model

@@ -30,6 +30,18 @@ if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 
+def _clone_rms_norm(norm: nn.Module) -> nn.Module:
+    """Clone RMSNorm weights onto the same device (avoid shared-module .cpu() yank)."""
+    eps = getattr(norm, "variance_epsilon", None)
+    if eps is None:
+        eps = getattr(norm, "eps", 1e-6)
+    device = norm.weight.device
+    dtype = norm.weight.dtype
+    cloned = type(norm)(norm.weight.shape[0], eps=eps)
+    cloned.weight = nn.Parameter(norm.weight.detach().clone().to(device=device, dtype=dtype))
+    return cloned
+
+
 class QuantMiniCPMMLP(nn.Module):
     def __init__(
         self,
@@ -332,8 +344,10 @@ class QuantMiniCPMDecoderLayerV2(nn.Module):
             args=args,
             layer_idx=layer_idx
         )
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Independent norm copies (device-safe). Sharing ori norms breaks when
+        # layers[i].cpu() later moves the same Module off CUDA.
+        self.input_layernorm = _clone_rms_norm(ori_layer.input_layernorm)
+        self.post_attention_layernorm = _clone_rms_norm(ori_layer.post_attention_layernorm)
         
     def forward(
         self,

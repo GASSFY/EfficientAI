@@ -161,11 +161,10 @@ class FlexibleScaler:
                 # 检查 Inf/NaN (BF16 模式下通常不需要，但为了安全保留)
                 for p in parameters_with_grad:
                     if not torch.isfinite(p.grad).all():
-                        print(f"!!! BF16 ERROR: Inf/NaN gradient detected in parameter. dtype: {p.grad.dtype}")                        
+                        print(f"!!! BF16 ERROR: Inf/NaN gradient detected in parameter. dtype: {p.grad.dtype}")
                         optimizer.zero_grad()
                         # 注意：BF16 模式下没有 scaler.update()，直接返回 None
-                        return None 
-                    # print(f'name: {p._name}, grad: {p.grad.mean()}')
+                        return None
                 # 梯度裁剪和范数计算
                 if clip_grad is not None:
                     norm = torch.nn.utils.clip_grad_norm_(parameters_with_grad, clip_grad)

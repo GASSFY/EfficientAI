@@ -197,6 +197,9 @@ def evaluate(llm, args, logger):
             llm.model = llm.model.to(llm.device)
         elif "falcon" in args.net.lower():
             llm.model.transformer = llm.model.transformer.to(llm.device)
+        elif "internvl" in args.model.lower() or ("onevision" in args.model.lower() and "llava" in args.model.lower()):
+            # layers/embeds may sit on CPU after MAS replace; move whole model for eval
+            llm.model = llm.model.to(llm.device)
 
     if args.eval_sqnr:
         from more_itertools import batched
@@ -477,7 +480,7 @@ def evaluate(llm, args, logger):
             logger.info("Average accuracy: {:.4f}".format(weighted_acc))
     
     if args.tasks_multimodal != "":
-        
+        model_key = args.model.lower()
         if 'Omni' in args.model:
             print(f'--------->>>>>>>>>>>>>>>>>>>> omni model !!!!!!!!!!!')
             from models.LMMClass_Omni import LMMClass
@@ -491,6 +494,42 @@ def evaluate(llm, args, logger):
             )
             results.update(t_results['results'])
             logger.info(results)
+        elif "internvl" in model_key:
+            from models.LMMClass_InternVL import LMMClass
+            vlm = LMMClass(args.model, llm.model)
+            t_results = eval_multimodal.simple_evaluate(
+                vlm,
+                tasks=args.tasks_multimodal.split(","),
+                num_fewshot=args.num_fewshot,
+                limit=None if args.limit_multimodal == 1.0 else args.limit_multimodal,
+                gen_kwargs=f"max_new_tokens={args.gen_max_new_tokens}",
+                cli_args=argparse.Namespace(
+                    output_path=args.output_dir,
+                    process_with_media=False,
+                ),
+            )
+            results.update(t_results['results'])
+            logger.info(results)
+            print(f'tasks_multimodal:  {results}')
+        elif ("llava-onevision" in model_key) or ("llava_onevision" in model_key) or (
+            "onevision" in model_key and "llava" in model_key
+        ):
+            from models.LMMClass_LLaVAOV import LMMClass
+            vlm = LMMClass(args.model, llm.model)
+            t_results = eval_multimodal.simple_evaluate(
+                vlm,
+                tasks=args.tasks_multimodal.split(","),
+                num_fewshot=args.num_fewshot,
+                limit=None if args.limit_multimodal == 1.0 else args.limit_multimodal,
+                gen_kwargs=f"max_new_tokens={args.gen_max_new_tokens}",
+                cli_args=argparse.Namespace(
+                    output_path=args.output_dir,
+                    process_with_media=False,
+                ),
+            )
+            results.update(t_results['results'])
+            logger.info(results)
+            print(f'tasks_multimodal:  {results}')
         else:
             from models.LMMClass import LMMClass
             vlm = LMMClass(args.model, llm.model)
@@ -713,6 +752,7 @@ def main_entry(args=None):
             dataloader = torch.load(cache_dataloader, weights_only=False)
             print(f"load calibration from {cache_dataloader}")
         else:     
+            model_key = args.model.lower()
             if 'Qwen' in args.model or 'MiniCPM' in args.model:
                 from custom_dataset import prepare_dataset, prepare_dataset_before_quant
                 from transformers import (
@@ -724,6 +764,14 @@ def main_entry(args=None):
                 processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
                 is_minicpm = 'MiniCPM' in args.model
                 dataloader = prepare_dataset_before_quant(processor, calibration_dataset, batch_size=args.batch_size, is_minicpm=is_minicpm)
+            elif "internvl" in model_key:
+                from custom_dataset import prepare_calib_internvl
+                dataloader = prepare_calib_internvl(llm, n_sample=args.nsamples)
+            elif ("llava-onevision" in model_key) or ("llava_onevision" in model_key) or (
+                "onevision" in model_key and "llava" in model_key
+            ):
+                from custom_dataset import prepare_calib_llava_onevision
+                dataloader = prepare_calib_llava_onevision(llm, n_sample=args.nsamples)
             else:
                 dataloader, _ = get_loaders(
                     args.calib_dataset,

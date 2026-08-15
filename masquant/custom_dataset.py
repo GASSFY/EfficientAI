@@ -197,3 +197,82 @@ def prepare_dataset_before_quant(processor, calibration_dataset, batch_size: int
             calib_data.append(inputs)
     return calib_data
 
+
+def _load_sharegpt_items(n_sample: int):
+    import json
+    from PIL import Image
+
+    dataset_json = "/root/autodl-tmp/hf_home/datasets/coco/sharegpt4v_coco_only.json"
+    prefix_path = "/root/autodl-tmp/hf_home/datasets/"
+    with open(dataset_json, "r") as f:
+        dataset = json.load(f)
+    items = []
+    for i in range(min(n_sample, len(dataset))):
+        data_item = dataset[i]
+        image = Image.open(prefix_path + data_item["image"]).convert("RGB")
+        items.append((image, data_item))
+    return items
+
+
+def prepare_calib_internvl(llm, n_sample: int = 8):
+    """Build InternVL2 calibration batches for MAS Catcher / act-scale collection."""
+    import torch
+    from models.process_models import get_process_model
+
+    wrapper = get_process_model("internvl2")(llm.model, llm.tokenizer)
+    # Vision tower weights are bf16/fp16; transform() yields float32 by default.
+    pix_dtype = getattr(llm.model, "dtype", None) or torch.bfloat16
+    calib_data = []
+    for image, data_item in _load_sharegpt_items(n_sample):
+        sample = wrapper.preprocess_data([image], data_item)
+        batch = {
+            "input_ids": sample["input_ids"].unsqueeze(0),
+            "attention_mask": sample["attention_mask"].unsqueeze(0),
+            "pixel_values": sample["pixel_values"].to(dtype=pix_dtype),
+            "image_flags": sample["image_flags"],
+        }
+        calib_data.append(batch)
+    return calib_data
+
+
+def prepare_calib_llava_onevision(llm, n_sample: int = 8):
+    """Build LLaVA-OneVision calibration batches."""
+    import torch
+    from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+    from llava.mm_utils import process_images, tokenizer_image_token
+
+    image_processor = getattr(llm, "image_processor", None)
+    if image_processor is None:
+        image_processor = llm.model.get_vision_tower().image_processor
+    pad_id = (
+        llm.tokenizer.pad_token_id
+        if llm.tokenizer.pad_token_id is not None
+        else llm.tokenizer.eos_token_id
+    )
+    calib_data = []
+    for image, data_item in _load_sharegpt_items(n_sample):
+        user_text = ""
+        for conv in data_item["conversations"]:
+            if conv["from"] == "human":
+                user_text = conv["value"].replace("<image>", "").strip()
+                break
+        prompt = DEFAULT_IMAGE_TOKEN + "\n" + user_text
+        input_ids = tokenizer_image_token(
+            prompt, llm.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+        ).unsqueeze(0)
+        image_tensor = process_images([image], image_processor, llm.model.config)
+        if isinstance(image_tensor, list):
+            images = [t.to(dtype=torch.float16) for t in image_tensor]
+        else:
+            images = image_tensor.to(dtype=torch.float16)
+        calib_data.append(
+            {
+                "input_ids": input_ids,
+                "attention_mask": input_ids.ne(pad_id),
+                "images": images,
+                "image_sizes": [image.size],
+                "modalities": ["image"],
+            }
+        )
+    return calib_data
+

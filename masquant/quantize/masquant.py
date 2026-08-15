@@ -127,9 +127,13 @@ def masquant(
     if 'Qwen2.5-Omni' in args.model:
         use_cache = model.config.text_config.use_cache
         model.config.text_config.use_cache = False
-    elif 'MiniCPM' in args.model or 'llama' in args.model:
-        use_cache = model.config.use_cache
-        model.config.use_cache = False
+    elif "internvl" in args.model.lower():
+        use_cache = getattr(model.language_model.config, "use_cache", False)
+        model.language_model.config.use_cache = False
+    elif 'MiniCPM' in args.model or 'llama' in args.model or "onevision" in args.model.lower():
+        use_cache = getattr(model.config, "use_cache", False)
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
 
     is_llama = False
     if "minicpm" in args.net.lower():
@@ -236,9 +240,58 @@ def masquant(
             "up_proj":"fc1",
             # "down_proj": "fc2"
         }
-        layer_name_prefix = "model.language_model.layers"        
+        layer_name_prefix = "model.language_model.layers"
+    elif "internvl" in args.model.lower():
+        is_llama = True
+        # InternVLChatModel -> language_model (InternLM2) -> model.layers
+        # Do not shadow outer `lm` (LMClass); keep tokenizer / device access.
+        lang_model = model.language_model
+        layers = lang_model.model.layers
+        if hasattr(lang_model.model, "tok_embeddings"):
+            lang_model.model.tok_embeddings = lang_model.model.tok_embeddings.to(dev)
+        else:
+            lang_model.model.embed_tokens = lang_model.model.embed_tokens.to(dev)
+        lang_model.model.norm = lang_model.model.norm.to(dev)
+        model.vision_model = model.vision_model.to(dev)
+        model.mlp1 = model.mlp1.to(dev)
+        from models.int_internvl_layer import QuantInternVLDecoderLayerV2
+        DecoderLayer = QuantInternVLDecoderLayerV2
+        pairs = {
+            "wqkv": "qkv",
+            "wo": "out",
+            "w1": "fc1",
+        }
+        layer_name_prefix = "language_model.model.layers"
+        print("当前使用 InternVL2，使用 QuantInternVLDecoderLayerV2")
+    elif ("llava-onevision" in args.model.lower()) or ("llava_onevision" in args.model.lower()) or (
+        "onevision" in args.model.lower() and "llava" in args.model.lower()
+    ):
+        is_llama = True
+        # LlavaQwenForCausalLM -> model.model.layers
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        if hasattr(model.model, "rotary_emb"):
+            model.model.rotary_emb = model.model.rotary_emb.to(dev)
+        # Vision tower / projector may stay on CPU under some device_map loads.
+        if hasattr(model, "get_vision_tower"):
+            vt = model.get_vision_tower()
+            if vt is not None:
+                vt.to(dev)
+        for attr in ("mm_projector", "vision_resampler"):
+            if hasattr(model.model, attr) and getattr(model.model, attr) is not None:
+                setattr(model.model, attr, getattr(model.model, attr).to(dev))
+        from models.int_minicpm_layer import QuantMiniCPMDecoderLayerV2
+        DecoderLayer = QuantMiniCPMDecoderLayerV2
+        pairs = {
+            "q_proj": "qkv",
+            "o_proj": "out",
+            "up_proj": "fc1",
+        }
+        layer_name_prefix = "model.layers"
+        print("当前使用 LLaVA-OneVision，使用 QuantMiniCPMDecoderLayerV2 (Qwen2)")
     else:
-        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/InternVL/LLaVA-OneVision now")
     
     layers[0] = layers[0].to(dev)
     # 关于数据类型的说明：模型是用 float16 来 load 的，那么权重和激活也就是 float16 的，但是scale 是 float64，所以权重乘以 scale 的时候，要转换成 float64 再乘，结果再转换成 float16，激活也是同样的逻辑:
@@ -285,6 +338,14 @@ def masquant(
                 
                 multi_modal_mask_cache.append((audio_mask, image_mask, text_mask))
                 kwargs['multi_modal_mask'] = (audio_mask, image_mask, text_mask)
+            elif 'multi_modal_mask' not in kwargs and hasattr(model, "_mas_mm_mask") and model._mas_mm_mask is not None:
+                mm = model._mas_mm_mask
+                # LLaVA expands IMAGE_TOKEN_INDEX into many vision tokens before layer-0;
+                # rebuild mask to match Catcher activation length when needed.
+                if ("llava-onevision" in args.model.lower()) or ("onevision" in args.model.lower()):
+                    mm = _expand_llava_mm_mask_to_inp(mm, inp, getattr(model, "_mas_input_ids", None))
+                multi_modal_mask_cache.append(mm)
+                kwargs["multi_modal_mask"] = mm
             elif 'multi_modal_mask' in kwargs:
                 multi_modal_mask_cache.append(kwargs['multi_modal_mask'])
             
@@ -294,13 +355,112 @@ def masquant(
             cache["i"] += 1
             if 'position_embeddings' in kwargs:
                 position_embeddings_cache.append(kwargs["position_embeddings"])
-            attention_mask_cache.append(kwargs["attention_mask"])
-            if self.is_llama:
+            attention_mask_cache.append(kwargs.get("attention_mask"))
+            if self.is_llama and "position_ids" in kwargs:
                 position_ids_cache.append(kwargs["position_ids"])
             raise ValueError
 
     layers[0] = Catcher(layers[0])
     layers[0].is_llama = is_llama
+
+    def _expand_llava_mm_mask_to_inp(mm_mask, inp, input_ids):
+        """Expand pre-IMAGE_TOKEN mask to post-multimodal-merge sequence length."""
+        audio_mask, image_mask, text_mask = mm_mask
+        if inp.dim() == 2:
+            # [S, H] -> treat as batch 1
+            seq_len, hidden = inp.shape
+            bsz = 1
+        else:
+            bsz, seq_len, hidden = inp.shape
+        if image_mask is not None and image_mask.shape[1] == seq_len:
+            # already aligned; only fix hidden broadcast if needed
+            if image_mask.shape[-1] != hidden:
+                image_mask = image_mask[..., :1].expand(bsz, seq_len, hidden).contiguous()
+                text_mask = ~image_mask
+                audio_mask = torch.zeros_like(image_mask, dtype=torch.bool)
+            return audio_mask, image_mask, text_mask
+
+        from llava.constants import IMAGE_TOKEN_INDEX
+        device = inp.device
+        if input_ids is None:
+            # Fallback: treat all tokens as text (LET still runs; modality split weak)
+            image_mask = torch.zeros((bsz, seq_len, hidden), dtype=torch.bool, device=device)
+            text_mask = torch.ones_like(image_mask)
+            audio_mask = torch.zeros_like(image_mask)
+            return audio_mask, image_mask, text_mask
+
+        ids = input_ids.to(device)
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        expanded = []
+        for b in range(bsz):
+            row = ids[b] if b < ids.shape[0] else ids[0]
+            s0 = row.numel()
+            n_img = int((row == IMAGE_TOKEN_INDEX).sum().item())
+            n_text = s0 - n_img
+            n_vision = max(seq_len - n_text, 0)
+            if n_img <= 0 or n_vision <= 0:
+                expanded.append(torch.zeros(seq_len, dtype=torch.bool, device=device))
+                continue
+            # Distribute vision tokens across IMAGE_TOKEN placeholders (left-to-right).
+            base, rem = divmod(n_vision, n_img)
+            parts = []
+            img_i = 0
+            for tok in row.tolist():
+                if tok == IMAGE_TOKEN_INDEX:
+                    span = base + (1 if img_i < rem else 0)
+                    parts.append(torch.ones(span, dtype=torch.bool, device=device))
+                    img_i += 1
+                else:
+                    parts.append(torch.zeros(1, dtype=torch.bool, device=device))
+            pos = torch.cat(parts) if parts else torch.zeros(0, dtype=torch.bool, device=device)
+            if pos.numel() < seq_len:
+                pos = torch.cat([pos, torch.zeros(seq_len - pos.numel(), dtype=torch.bool, device=device)])
+            elif pos.numel() > seq_len:
+                pos = pos[:seq_len]
+            expanded.append(pos)
+        image_1d = torch.stack(expanded, dim=0)  # [B, S]
+        image_mask = image_1d.unsqueeze(-1).expand(bsz, seq_len, hidden).contiguous()
+        text_mask = ~image_mask
+        audio_mask = torch.zeros_like(image_mask, dtype=torch.bool)
+        return audio_mask, image_mask, text_mask
+
+    def _stash_mm_mask_from_batch(batch):
+        """Build MAS (audio, image, text) mask from calibration input_ids."""
+        if "input_ids" not in batch:
+            model._mas_mm_mask = None
+            model._mas_input_ids = None
+            return
+        input_ids = batch["input_ids"]
+        model._mas_input_ids = input_ids.detach().cpu() if torch.is_tensor(input_ids) else input_ids
+        if "internvl" in args.model.lower():
+            from models.internvl2.constants import IMG_CONTEXT_TOKEN
+            image_token_id = lm.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN) if hasattr(lm, "tokenizer") else None
+            if image_token_id is None:
+                image_token_id = getattr(model, "img_context_token_id", None)
+            if image_token_id is None:
+                image_token_id = 92546
+            image_mask = input_ids == image_token_id
+        elif ("llava-onevision" in args.model.lower()) or ("onevision" in args.model.lower()):
+            from llava.constants import IMAGE_TOKEN_INDEX
+            # Pre-expansion placeholder; Catcher expands to post-merge length.
+            image_mask = input_ids == IMAGE_TOKEN_INDEX
+        else:
+            model._mas_mm_mask = None
+            return
+        # Expand to [B, S, H] to match QuantLinear.get_masked_value (exact shape).
+        if "internvl" in args.model.lower():
+            hidden = int(model.language_model.config.hidden_size)
+        else:
+            hidden = int(getattr(model.config, "hidden_size", image_mask.shape[-1] if image_mask.dim() > 2 else 0) or 0)
+            if hidden <= 0 and hasattr(model, "model") and hasattr(model.model, "config"):
+                hidden = int(getattr(model.model.config, "hidden_size", 0) or 0)
+            if hidden <= 0:
+                hidden = 1
+        image_mask = image_mask.unsqueeze(-1).expand(-1, -1, hidden).contiguous().to(dev)
+        audio_mask = torch.zeros_like(image_mask, dtype=torch.bool)
+        text_mask = ~image_mask
+        model._mas_mm_mask = (audio_mask, image_mask, text_mask)
 
     with torch.no_grad():
         if args.epochs > 0:
@@ -314,6 +474,38 @@ def masquant(
                     elif 'MiniCPM' in args.model:
                         inputs = {k: v.to(dev) for k, v in batch.items()}
                         model(**inputs)
+                    elif "internvl" in args.model.lower():
+                        _stash_mm_mask_from_batch(batch)
+                        inputs = {}
+                        for k, v in batch.items():
+                            if torch.is_tensor(v):
+                                if v.is_floating_point():
+                                    inputs[k] = v.to(device=dev, dtype=model.dtype)
+                                else:
+                                    inputs[k] = v.to(dev)
+                            else:
+                                inputs[k] = v
+                        # set img context id for feature inject
+                        if hasattr(lm, "tokenizer"):
+                            from models.internvl2.constants import IMG_CONTEXT_TOKEN
+                            model.img_context_token_id = lm.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+                        model(**inputs)
+                    elif ("llava-onevision" in args.model.lower()) or ("onevision" in args.model.lower()):
+                        _stash_mm_mask_from_batch(batch)
+                        input_ids = batch["input_ids"].to(dev)
+                        attention_mask = batch["attention_mask"].to(dev)
+                        images = batch["images"]
+                        if torch.is_tensor(images):
+                            images = images.to(dev)
+                        elif isinstance(images, list):
+                            images = [t.to(dev) for t in images]
+                        model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            images=images,
+                            image_sizes=batch.get("image_sizes"),
+                            modalities=batch.get("modalities"),
+                        )
                     else:                
                         model(batch["input_ids"].to(dev), batch['attention_mask'])
                 except ValueError:
@@ -321,7 +513,29 @@ def masquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "mixtral" in args.net.lower() or 'qwen' in args.net.lower() or 'minicpm' in args.net.lower():
+    if "internvl" in args.model.lower():
+        lm_inner = model.language_model.model
+        if hasattr(lm_inner, "tok_embeddings"):
+            lm_inner.tok_embeddings = lm_inner.tok_embeddings.cpu()
+        if hasattr(lm_inner, "embed_tokens"):
+            lm_inner.embed_tokens = lm_inner.embed_tokens.cpu()
+        lm_inner.norm = lm_inner.norm.cpu()
+        # Vision unused after Catcher; free VRAM for long-seq LET.
+        if hasattr(model, "vision_model") and model.vision_model is not None:
+            model.vision_model = model.vision_model.cpu()
+        if hasattr(model, "mlp1") and model.mlp1 is not None:
+            model.mlp1 = model.mlp1.cpu()
+    elif ("llava-onevision" in args.model.lower()) or ("onevision" in args.model.lower()):
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+        model.model.norm = model.model.norm.cpu()
+        if hasattr(model, "get_vision_tower"):
+            vt = model.get_vision_tower()
+            if vt is not None:
+                vt.to("cpu")
+        for attr in ("mm_projector", "vision_resampler"):
+            if hasattr(model.model, attr) and getattr(model.model, attr) is not None:
+                setattr(model.model, attr, getattr(model.model, attr).cpu())
+    elif "llama" in args.net.lower() or "mixtral" in args.net.lower() or 'qwen' in args.net.lower() or 'minicpm' in args.net.lower():
         if 'Qwen2.5-VL' in args.model:
             model.language_model.embed_tokens = model.language_model.embed_tokens.cpu()
             model.language_model.norm = model.language_model.norm.cpu()
@@ -341,15 +555,64 @@ def masquant(
         raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral now")
     torch.cuda.empty_cache()
 
+    def _to_cpu(obj):
+        if obj is None:
+            return None
+        if torch.is_tensor(obj):
+            return obj.detach().cpu() if obj.requires_grad else obj.cpu()
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_to_cpu(x) for x in obj)
+        return obj
+
+    def _to_dev(obj):
+        if obj is None:
+            return None
+        if torch.is_tensor(obj):
+            return obj.to(dev)
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_to_dev(x) for x in obj)
+        return obj
+
+    # Keep activation / mask caches on CPU; pin one sample at a time during LET.
+    inps = [_to_cpu(x) for x in inps]
+    attention_mask_cache[:] = [_to_cpu(x) for x in attention_mask_cache]
+    position_embeddings_cache[:] = [_to_cpu(x) for x in position_embeddings_cache]
+    position_ids_cache[:] = [_to_cpu(x) for x in position_ids_cache]
+    multi_modal_mask_cache[:] = [_to_cpu(x) for x in multi_modal_mask_cache]
+    torch.cuda.empty_cache()
+
     # same input of first layer for fp model and quant model
     quant_inps = inps
     fp_inps = copy.deepcopy(inps)   # take output of fp model as input
     fp_inps_2 = copy.deepcopy(inps) if args.aug_loss else None # take output of quantization model as input
 
+    def _forward_sample(module, act, j):
+        """Run one calib sample on GPU; caches stay on CPU."""
+        x = _to_dev(act)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        kwargs = {}
+        if attention_mask_cache:
+            kwargs["attention_mask"] = _to_dev(attention_mask_cache[j])
+        if position_embeddings_cache:
+            kwargs["position_embeddings"] = _to_dev(position_embeddings_cache[j])
+        elif position_ids_cache:
+            kwargs["position_ids"] = _to_dev(position_ids_cache[j])
+        if multi_modal_mask_cache:
+            kwargs["multi_modal_mask"] = _to_dev(multi_modal_mask_cache[j])
+        return module(x, **kwargs)[0]
+
     loss_func = torch.nn.MSELoss()
 
     if args.resume:
         mas_parameters = torch.load(args.resume)
+        if not isinstance(mas_parameters, dict) or not all(i in mas_parameters for i in range(len(layers))):
+            have = sorted(mas_parameters.keys()) if isinstance(mas_parameters, dict) else type(mas_parameters)
+            raise ValueError(
+                f"Incomplete MAS checkpoint for resume: need layers 0..{len(layers)-1}, "
+                f"got {have} from {args.resume}. "
+                f"Delete/quarantine this file and retrain (overnight find_mas_ckpt may have picked an interrupted run)."
+            )
     else:
         mas_parameters = {}
     
@@ -372,6 +635,11 @@ def masquant(
                 qlayer = DecoderLayer(lm.model.config, layer, args)
             elif 'Qwen2.5-VL' in args.model:
                 qlayer = DecoderLayer(lm.model.config, layer, args, layer_idx=i)
+            elif "internvl" in args.model.lower():
+                qlayer = DecoderLayer(model.language_model.config, layer, args, layer_idx=i)
+            elif ("llava-onevision" in args.model.lower()) or ("onevision" in args.model.lower()):
+                # LlavaQwen: language config fields live on the root config
+                qlayer = DecoderLayer(model.config, layer, args, layer_idx=i)
         qlayer = qlayer.to(dev)
 
         # obtain output of full-precision model
@@ -380,23 +648,12 @@ def masquant(
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=dtype):
                     for j in range(args.nsamples):
-                        if len(position_embeddings_cache) and len(multi_modal_mask_cache):
-                            fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0) if fp_inps[j].dim() == 2 else fp_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-                        elif len(position_embeddings_cache):
-                            fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0) if fp_inps[j].dim() == 2 else fp_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j])[0]
-                        else:
-                            fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0) if fp_inps[j].dim() == 2 else fp_inps[j], attention_mask=attention_mask_cache[j])[0]
-                        
-                        if torch.isnan(fp_inps[j]).any() == True:
-                            import pdb;pdb.set_trace()
-                        
+                        out = _forward_sample(qlayer, fp_inps[j], j)
+                        if torch.isnan(out).any():
+                            raise RuntimeError(f"NaN in fp_inps forward (layer={i}, sample={j})")
+                        fp_inps[j] = _to_cpu(out)
                         if args.aug_loss:
-                            if len(position_embeddings_cache) and len(multi_modal_mask_cache):
-                                fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-                            elif len(position_embeddings_cache):
-                                fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j])[0]
-                            else:
-                                fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask_cache[j])[0]
+                            fp_inps_2[j] = _to_cpu(_forward_sample(qlayer, quant_inps[j], j))
         # init smooth parameters
         set_quant_state(qlayer, weight_quant=True, act_quant=True)  # weight will be manually quantized before forward
         qlayer.let = args.let
@@ -438,8 +695,7 @@ def masquant(
                                 best_alpha = alpha_vision_min
                                 fp_out = []
                                 for j in range(args.nsamples):
-                                    fp_out_tmp = layers[i](quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j])[0]
-                                    fp_out.append(fp_out_tmp)
+                                    fp_out.append(_to_cpu(_forward_sample(layers[i], quant_inps[j], j)))
                                     if j >= max_sqnr_sample_count:
                                         break            
 
@@ -453,9 +709,8 @@ def masquant(
                                     # 开始统计哪个 alpha 比较好
                                     sqnr_quant = 0
                                     for j in range(args.nsamples):
-                                        quant_out = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-
-                                        sqnr_quant += compute_sqnr_simple(fp_out[j], quant_out)
+                                        quant_out = _forward_sample(qlayer, quant_inps[j], j)
+                                        sqnr_quant += compute_sqnr_simple(_to_dev(fp_out[j]), quant_out)
                                         # print(f'sqnr_quant_{j}:  {sqnr_quant}, sqnr_max:  {sqnr_max}, quant_out: {quant_out.mean()}, fp_out: {fp_out[j].mean()}')
                                         if j >= max_sqnr_sample_count:
                                             break
@@ -478,14 +733,15 @@ def masquant(
                                 sqnr_merged = 0
                                 fp_out = []
                                 for j in range(args.nsamples):
-                                    fp_out_tmp = layers[i](quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j])[0]
-                                    fp_out.append(fp_out_tmp)
+                                    fp_out.append(_to_cpu(_forward_sample(layers[i], quant_inps[j], j)))
                                     if j >= max_sqnr_sample_count:
                                         break                                
                                 # 先计算三模态的sqnr
                                 for j in range(args.nsamples):
-                                    quant_out = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-                                    sqnr_split += compute_sqnr_simple_multimodal(fp_out[j], quant_out, multi_modal_mask=multi_modal_mask_cache[j])
+                                    quant_out = _forward_sample(qlayer, quant_inps[j], j)
+                                    sqnr_split += compute_sqnr_simple_multimodal(
+                                        _to_dev(fp_out[j]), quant_out, multi_modal_mask=_to_dev(multi_modal_mask_cache[j])
+                                    )
                                     if j >= max_sqnr_sample_count:
                                         break
                                 # 再计算统一模态的sqnr， 注意需要先修改 scale 为统一模态的值.
@@ -494,8 +750,10 @@ def masquant(
                                     module.audio_smooth_scale.data.copy_(scale_all_in_one)
                                     module.vision_smooth_scale.data.copy_(scale_all_in_one)                                
                                 for j in range(args.nsamples):
-                                    quant_out = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-                                    sqnr_merged += compute_sqnr_simple_multimodal(fp_out[j], quant_out, multi_modal_mask=multi_modal_mask_cache[j])
+                                    quant_out = _forward_sample(qlayer, quant_inps[j], j)
+                                    sqnr_merged += compute_sqnr_simple_multimodal(
+                                        _to_dev(fp_out[j]), quant_out, multi_modal_mask=_to_dev(multi_modal_mask_cache[j])
+                                    )
                                     if j >= max_sqnr_sample_count:
                                         break
 
@@ -537,18 +795,15 @@ def masquant(
                     # obtain output of quantization model
                     with traincast():
                         truncate_scale(qlayer, args)
-                        # import pdb;pdb.set_trace()
-                        if len(position_embeddings_cache) and len(multi_modal_mask_cache):
-                            quant_out = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-                        elif len(position_embeddings_cache):
-                            quant_out = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j])[0]
+                        quant_out = _forward_sample(qlayer, quant_inps[j], j)
+                        fp_tgt = _to_dev(fp_inps[j])
+                        if multi_modal_mask_cache:
+                            audio_mask, image_mask, text_mask = _to_dev(multi_modal_mask_cache[j])
                         else:
-                            quant_out = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j])[0]
-                        # print(f'fp_inps: {fp_inps[j]}')
+                            audio_mask = image_mask = text_mask = None
                         
                         if args.loss_multi_modal: 
-                            (audio_mask, image_mask, text_mask) = multi_modal_mask_cache[j]
-                            quant_diff = (quant_out-fp_inps[j]).pow(2)
+                            quant_diff = (quant_out-fp_tgt).pow(2)
                             text_diff = quant_diff*text_mask
                             audio_diff = quant_diff*audio_mask
                             vision_diff = quant_diff*image_mask
@@ -561,8 +816,7 @@ def masquant(
                             # print(f'loss_multi_modal: {loss_multi_modal}, text: {text_loss/loss_multi_modal}, vision: {vision_loss/loss_multi_modal}, audio: {audio_loss/loss_multi_modal}')
                             loss = loss_multi_modal
                         elif args.loss_multi_modal_mae: 
-                            (audio_mask, image_mask, text_mask) = multi_modal_mask_cache[j]
-                            quant_diff = (quant_out-fp_inps[j]).abs()
+                            quant_diff = (quant_out-fp_tgt).abs()
                             text_diff = quant_diff*text_mask
                             audio_diff = quant_diff*audio_mask
                             vision_diff = quant_diff*image_mask
@@ -570,8 +824,7 @@ def masquant(
                             total_mask = (text_mask.sum() + audio_mask.sum() + image_mask.sum())
                             loss = (text_diff.sum() + audio_diff.sum() + vision_diff.sum()) / total_mask
                         elif args.loss_multi_modal_mae_alpha: 
-                            (audio_mask, image_mask, text_mask) = multi_modal_mask_cache[j]
-                            quant_diff = (quant_out-fp_inps[j]).abs()
+                            quant_diff = (quant_out-fp_tgt).abs()
                             text_diff = quant_diff*text_mask
                             total_mask = text_mask.sum()
                             
@@ -603,9 +856,9 @@ def masquant(
                             else:
                                 loss = (text_diff.sum() + vision_diff.sum()) / total_mask
                         else:
-                            loss = loss_func(fp_inps[j].to(torch.float32), quant_out.to(torch.float32))
+                            loss = loss_func(fp_tgt.to(torch.float32), quant_out.to(torch.float32))
                         if args.aug_loss:
-                            loss += loss_func(fp_inps_2[j], quant_out)
+                            loss += loss_func(_to_dev(fp_inps_2[j]), quant_out)
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         import pdb; pdb.set_trace()
@@ -634,7 +887,10 @@ def masquant(
                     max_epochs += max_epochs
                     logger.info(f"Extending training. New max_epochs: {max_epochs}")
             clear_temp_variable(qlayer)
-            del optimizer        
+            del optimizer
+            # Scales can go negative after the last AdamW step; post-train
+            # forward then hits input/(scale+eps)~Inf (W8A8/W4A16 crash).
+            truncate_scale(qlayer, args)
         # real smooth and quantization
         # smooth_and_quant_inplace(qlayer, args, is_llama)
         if args.epochs>0:
@@ -643,13 +899,7 @@ def masquant(
                 # with torch.cuda.amp.autocast():
                 with traincast():
                     for j in range(args.nsamples):
-                        if len(position_embeddings_cache) and len(multi_modal_mask_cache):
-                            quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j], multi_modal_mask=multi_modal_mask_cache[j])[0]
-                        elif len(position_embeddings_cache):
-                            quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j], position_embeddings=position_embeddings_cache[j])[0]
-                        else:
-                            quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0) if quant_inps[j].dim() == 2 else quant_inps[j], attention_mask=attention_mask_cache[j])[0]
-                            
+                        quant_inps[j] = _to_cpu(_forward_sample(qlayer, quant_inps[j], j))
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             mas_parameters[i] = mas_state_dict(qlayer)
@@ -672,6 +922,9 @@ def masquant(
     gc.collect()                    
     if 'Qwen2.5-Omni' in args.model:
         model.config.text_config.use_cache = use_cache
-    elif 'MiniCPM' in args.model or 'llama' in args.model:
-        model.config.use_cache = use_cache
+    elif "internvl" in args.model.lower():
+        model.language_model.config.use_cache = use_cache
+    elif 'MiniCPM' in args.model or 'llama' in args.model or "onevision" in args.model.lower():
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = use_cache
     return model

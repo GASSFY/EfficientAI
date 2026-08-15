@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# Overnight train (if missing) + full multimodal evaluation for MAS-Quant.
+# Overnight train (if missing) + full multimodal evaluation for InternVL2.
+# Train and eval live in this single script.
 #
-# Order: W4A16 OCRBench -> W8A8 train+eval -> W4A6 train+eval
+# Order: FP16 4-task suite -> W4A16 train+4-task -> W8A8 train+4-task -> W4A6 train+4-task
+# Suite: mmmu_val / realworldqa / ai2d (tokens=16) + ocrbench (tokens=128)
 #
 # Depends on:
-#   - act_scales/<model>-<dataset-type>-<nsamples>.pt  (required before training)
-#   - optional existing outputs/*-2epochs-*/mas_parameters.pth (skips retrain)
+#   - act_scales/<model>-<dataset-type>-<nsamples>.pt  (generate separately first)
+#   - optional existing outputs_internvl/*-2epochs-*/mas_parameters.pth (skips retrain)
 #
 # Writes:
-#   - outputs/<run>/...          (main.py logs + mas_parameters.pth when training)
-#   - logs/overnight/run_*.log, status_*.txt, summary_*.{txt,csv}
+#   - outputs_internvl/<run>/...
+#   - logs/overnight/internvl2_8b/run_*.log, status_*.txt, summary_*.{txt,csv}
 #
 # Usage:
-#   bash run_overnight.sh              # full suite
-#   SMOKE=1 bash run_overnight.sh      # only W4A16 OCRBench with 2 samples
+#   bash run_overnight_internvl.sh
+#   SMOKE=1 bash run_overnight_internvl.sh
 #
-# See ARTIFACTS.md for directory meanings. Scores can be copied into experiments/.
+# See ARTIFACTS.md for directory meanings.
 
 set -u
 set +e
@@ -23,23 +25,20 @@ set +e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-VL-7B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-OpenGVLab/InternVL2-8B}"
 NET_NAME="$(basename "${MODEL_PATH}")"
-OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs_internvl}"
 CACHE_DIR="${CACHE_DIR:-./cache}"
 NSAMPLES="${NSAMPLES:-128}"
 EPOCHS="${EPOCHS:-2}"
 GPU_ID="${GPU_ID:-0}"
 DATASET_TYPE="${DATASET_TYPE:-text-vision}"
-# Full run: LIMIT_MULTIMODAL=1.0
-# Smoke:    SMOKE=1  (implies limit=2 samples, only W4A16 ocrbench, no missing-ckpt training)
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-eager}"
 SMOKE="${SMOKE:-0}"
 LIMIT_MULTIMODAL="${LIMIT_MULTIMODAL:-1.0}"
 SKIP_MISSING_TRAIN="${SKIP_MISSING_TRAIN:-0}"
 
 if [[ "${SMOKE}" == "1" ]]; then
-  LIMIT_MULTIMODAL="${LIMIT_MULTIMODAL:-2}"
-  # If user left default 1.0 while SMOKE=1, force a tiny limit.
   if [[ "${LIMIT_MULTIMODAL}" == "1.0" ]]; then
     LIMIT_MULTIMODAL="2"
   fi
@@ -51,7 +50,7 @@ export API_TYPE="${API_TYPE:-dummy}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="${ROOT_DIR}/logs/overnight"
+LOG_DIR="${ROOT_DIR}/logs/overnight/internvl2_8b"
 mkdir -p "${CACHE_DIR}" "${OUTPUT_ROOT}" "${LOG_DIR}"
 
 RUN_LOG="${LOG_DIR}/run_${STAMP}.log"
@@ -63,18 +62,21 @@ RESULT_MARKERS=()
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 echo "========================================="
-echo "Overnight MAS-Quant eval  ${STAMP}"
+echo "Overnight InternVL2 MAS-Quant  ${STAMP}"
 echo "ROOT_DIR=${ROOT_DIR}"
 echo "MODEL_PATH=${MODEL_PATH}"
 echo "OUTPUT_ROOT=${OUTPUT_ROOT}"
+echo "LOG_DIR=${LOG_DIR}"
 echo "inference_mode=${inference_mode}"
+echo "attn_implementation=${ATTN_IMPLEMENTATION}"
 echo "SMOKE=${SMOKE}  LIMIT_MULTIMODAL=${LIMIT_MULTIMODAL}  SKIP_MISSING_TRAIN=${SKIP_MISSING_TRAIN}"
 echo "========================================="
 
 ACT_SCALES="./act_scales/${NET_NAME}-${DATASET_TYPE}-${NSAMPLES}.pt"
 if [[ ! -f "${ACT_SCALES}" ]]; then
   echo "[FATAL] act_scales missing: ${ACT_SCALES}"
-  echo "Run generate_act_scale_shift.py first."
+  echo "Run first:"
+  echo "  python generate_act_scale_shift.py --model ${MODEL_PATH} --dataset-type ${DATASET_TYPE} --nsamples ${NSAMPLES}"
   exit 1
 fi
 echo "[OK] act_scales: ${ACT_SCALES}"
@@ -96,13 +98,10 @@ record_status() {
 find_mas_ckpt() {
   local wbits="$1"
   local abits="$2"
-  # Prefer newest 2-epoch trained checkpoint for this bitwidth.
   ls -dt "${OUTPUT_ROOT}/${NET_NAME}-2epochs-w${wbits}a${abits}-"*-"${inference_mode}"/mas_parameters.pth 2>/dev/null | head -1
 }
 
 train_mas() {
-  # Ensures a 2-epoch mas_parameters.pth exists for wbits/abits.
-  # Does not print the path on stdout mixed with training logs; use find_mas_ckpt after.
   local wbits="$1"
   local abits="$2"
   local cfg="W${wbits}A${abits}"
@@ -137,7 +136,8 @@ train_mas() {
     --output_dir "${OUTPUT_ROOT}" \
     --symmetric \
     --group_size 0 \
-    --cache_dir "${CACHE_DIR}"
+    --cache_dir "${CACHE_DIR}" \
+    --attn_implementation "${ATTN_IMPLEMENTATION}"
   local code=$?
   local ckpt
   ckpt="$(find_mas_ckpt "${wbits}" "${abits}" || true)"
@@ -171,7 +171,6 @@ eval_task() {
   echo "resume=${resume}"
   echo "========================================="
 
-  # Capture printed output_dir from main.py for later summary.
   local tmp_out
   tmp_out="$(mktemp)"
   python main.py \
@@ -188,6 +187,7 @@ eval_task() {
     --symmetric \
     --group_size 0 \
     --cache_dir "${CACHE_DIR}" \
+    --attn_implementation "${ATTN_IMPLEMENTATION}" \
     --tasks_multimodal "${task}" \
     --gen_max_new_tokens "${max_new_tokens}" \
     --limit_multimodal "${LIMIT_MULTIMODAL}" 2>&1 | tee "${tmp_out}"
@@ -208,7 +208,6 @@ eval_task() {
   local status_str="OK"
   [[ "${code}" -eq 0 ]] || status_str="FAIL"
   record_status "eval_${job}" "${code}" "${out_hint:-}"
-  # CSV-escape commas in result by wrapping in quotes
   echo "${cfg},${task},${status_str},${code},${out_hint:-},\"${result_line}\"" >> "${SUMMARY_CSV}"
   rm -f "${tmp_out}"
   return "${code}"
@@ -225,20 +224,93 @@ eval_standard_suite() {
   eval_task "${wbits}" "${abits}" "${resume}" "ocrbench" 128
 }
 
-# -------- Job queue --------
+eval_fp16_task() {
+  # FP16 baseline: wbits=abits=16 skips MAS quantization in main.py.
+  local task="$1"
+  local max_new_tokens="$2"
+  local cfg="FP16"
+  local job="${cfg}_${task}"
 
-# 1) W4A16 OCRBench (existing ckpt)
-W4A16_CKPT="${W4A16_CKPT:-$(find_mas_ckpt 4 16 || true)}"
-if [[ -z "${W4A16_CKPT}" ]]; then
-  W4A16_CKPT="/root/autodl-tmp/quantization/EfficientAI/masquant/outputs/Qwen2.5-VL-7B-Instruct-2epochs-w4a16--0801-173551.325879-split_scales/mas_parameters.pth"
-fi
-echo "[PLAN] W4A16 ckpt: ${W4A16_CKPT}"
-eval_task 4 16 "${W4A16_CKPT}" "ocrbench" 128
+  echo "========================================="
+  echo "[EVAL] ${job}  max_new_tokens=${max_new_tokens}"
+  echo "========================================="
+
+  local tmp_out
+  tmp_out="$(mktemp)"
+  python main.py \
+    --model "${MODEL_PATH}" \
+    --mode train \
+    --epochs 0 \
+    --wbits 16 \
+    --abits 16 \
+    --dataset-type "${DATASET_TYPE}" \
+    --nsamples "${NSAMPLES}" \
+    --output_dir "${OUTPUT_ROOT}" \
+    --symmetric \
+    --group_size 0 \
+    --cache_dir "${CACHE_DIR}" \
+    --attn_implementation "${ATTN_IMPLEMENTATION}" \
+    --tasks_multimodal "${task}" \
+    --gen_max_new_tokens "${max_new_tokens}" \
+    --limit_multimodal "${LIMIT_MULTIMODAL}" 2>&1 | tee "${tmp_out}"
+  local code=${PIPESTATUS[0]}
+
+  local out_hint
+  out_hint="$(grep -oE 'output_dir is: [^ ]+' "${tmp_out}" | tail -1 | sed 's/.*output_dir is: //;s#/mas_parameters.pth[[:space:]]*##')"
+  local result_line
+  result_line="$(grep -E "tasks_multimodal:" "${tmp_out}" | tail -1 || true)"
+  if [[ -z "${result_line}" && -n "${out_hint}" && -d "${out_hint}" ]]; then
+    result_line="$(grep -hE 'tasks_multimodal:|ocrbench_accuracy|mmmu_acc|exact_match' "${out_hint}"/log_rank0_*.txt 2>/dev/null | tail -1 || true)"
+  fi
+
+  if [[ -n "${out_hint}" ]]; then
+    RESULT_MARKERS+=("${out_hint}")
+  fi
+
+  local status_str="OK"
+  [[ "${code}" -eq 0 ]] || status_str="FAIL"
+  record_status "eval_${job}" "${code}" "${out_hint:-}"
+  echo "${cfg},${task},${status_str},${code},${out_hint:-},\"${result_line}\"" >> "${SUMMARY_CSV}"
+  rm -f "${tmp_out}"
+  return "${code}"
+}
+
+eval_fp16_suite() {
+  eval_fp16_task "mmmu_val" 16
+  eval_fp16_task "realworldqa" 16
+  eval_fp16_task "ai2d" 16
+  eval_fp16_task "ocrbench" 128
+}
+
+# -------- Job queue (train then eval in one script) --------
 
 if [[ "${SMOKE}" == "1" ]]; then
-  echo "[SMOKE] Skipping W8A8/W4A6 train+full suites after one W4A16 OCRBench probe."
+  echo "[SMOKE] FP16 ai2d + W4A16 ocrbench probes only."
+  eval_fp16_task "ai2d" 16
+  W4A16_CKPT="${W4A16_CKPT:-$(find_mas_ckpt 4 16 || true)}"
+  if [[ -z "${W4A16_CKPT}" ]]; then
+    echo "[SMOKE] no W4A16 ckpt; skip quant probe (train with SMOKE=0 first)"
+    record_status "eval_W4A16_ocrbench" 1 "missing_resume"
+    echo "W4A16,ocrbench,FAIL,1,missing_resume," >> "${SUMMARY_CSV}"
+  else
+    echo "[PLAN] W4A16 ckpt: ${W4A16_CKPT}"
+    eval_task 4 16 "${W4A16_CKPT}" "ocrbench" 128
+  fi
+  echo "[SMOKE] Skipping full FP16/W4A16/W8A8/W4A6 suites."
 else
-  # 2) W8A8 train + eval
+  echo "[PLAN] FP16 baseline suite"
+  eval_fp16_suite
+
+  train_mas 4 16
+  W4A16_CKPT="$(find_mas_ckpt 4 16 || true)"
+  if [[ -n "${W4A16_CKPT}" && -f "${W4A16_CKPT}" ]]; then
+    echo "[PLAN] W4A16 ckpt: ${W4A16_CKPT}"
+    eval_standard_suite 4 16 "${W4A16_CKPT}"
+  else
+    echo "[ERROR] skip W4A16 eval suite (no checkpoint)"
+    record_status "eval_W4A16_suite" 1 "no_ckpt"
+  fi
+
   train_mas 8 8
   W8A8_CKPT="$(find_mas_ckpt 8 8 || true)"
   if [[ -n "${W8A8_CKPT}" && -f "${W8A8_CKPT}" ]]; then
@@ -249,7 +321,6 @@ else
     record_status "eval_W8A8_suite" 1 "no_ckpt"
   fi
 
-  # 3) W4A6 train + eval
   train_mas 4 6
   W4A6_CKPT="$(find_mas_ckpt 4 6 || true)"
   if [[ -n "${W4A6_CKPT}" && -f "${W4A6_CKPT}" ]]; then
@@ -263,8 +334,9 @@ fi
 
 # -------- Summary --------
 {
-  echo "Overnight summary  ${STAMP}"
+  echo "Overnight InternVL2 summary  ${STAMP}"
   echo "MODEL_PATH=${MODEL_PATH}"
+  echo "OUTPUT_ROOT=${OUTPUT_ROOT}"
   echo "inference_mode=${inference_mode}"
   echo ""
   echo "==== Job status ===="
@@ -283,14 +355,13 @@ fi
 } | tee "${SUMMARY_TXT}"
 
 echo "========================================="
-echo "Overnight run finished."
+echo "Overnight InternVL2 finished."
 echo "Status : ${STATUS_FILE}"
 echo "Summary: ${SUMMARY_TXT}"
 echo "CSV    : ${SUMMARY_CSV}"
 echo "Log    : ${RUN_LOG}"
 echo "========================================="
 
-# Exit non-zero if any FAIL in status file (for nohup monitoring)
 if grep -q '^FAIL' "${STATUS_FILE}"; then
   exit 1
 fi
