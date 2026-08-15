@@ -157,6 +157,66 @@ def compute_sqnr_per_token(original, quantized):
     
     return mean_sqnr.item()
 
+
+def _set_child_module(root, name, module):
+    parts = name.split('.')
+    parent = root
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    last = parts[-1]
+    if last.isdigit():
+        parent[int(last)] = module
+    else:
+        setattr(parent, last, module)
+
+
+def quantize_vision_tower_if_requested(model, args, logger=None):
+    if not getattr(args, 'quantize_vit', False):
+        return
+    visual = None
+    if hasattr(model, 'model') and hasattr(model.model, 'visual'):
+        visual = model.model.visual
+    elif hasattr(model, 'visual'):
+        visual = model.visual
+    elif hasattr(model, 'vision_model'):
+        visual = model.vision_model
+    if visual is None:
+        if logger is not None:
+            logger.warning('quantize_vit requested, but no visual tower was found.')
+        return
+
+    weight_params = dict(args.weight_quant_params)
+    weight_params['n_bits'] = args.vit_wbits
+    weight_params['group_size'] = None
+    act_params = dict(args.act_quant_params)
+    act_params['n_bits'] = args.vit_abits
+
+    replaced = 0
+    for name, module in list(visual.named_modules()):
+        if isinstance(module, nn.Linear):
+            qlinear = QuantLinear(
+                module,
+                weight_params,
+                act_params,
+                support_training=False,
+                name=f'visual.{name}',
+                mode=args.mode,
+            )
+            qlinear.set_quant_state(weight_quant=True, act_quant=True)
+            _set_child_module(visual, name, qlinear)
+            replaced += 1
+    if logger is not None:
+        logger.info(
+            f'quantize_vit enabled: replaced {replaced} visual Linear layers '
+            f'with W{args.vit_wbits}A{args.vit_abits} QuantLinear.'
+        )
+    else:
+        print(
+            f'quantize_vit enabled: replaced {replaced} visual Linear layers '
+            f'with W{args.vit_wbits}A{args.vit_abits} QuantLinear.'
+        )
+
+
 @torch.no_grad()
 def evaluate(llm, args, logger):
     results = {}
@@ -584,6 +644,18 @@ def main_entry(args=None):
     parser.add_argument("--loss_multi_modal", action="store_true")
     parser.add_argument("--loss_multi_modal_mae", action="store_true")
     parser.add_argument("--loss_multi_modal_mae_alpha", action="store_true")
+    parser.add_argument("--auto_modal_weight", action="store_true", help="learn layer-wise modality loss weights from calibration errors")
+    parser.add_argument("--modal_weight_tau", type=float, default=0.05, help="temperature for auto modality loss weights")
+    parser.add_argument("--adaptive_modal_scale", action="store_true", help="use token-adaptive soft mixing of text/vision/audio scales")
+    parser.add_argument("--adaptive_scale_tau", type=float, default=1.0, help="temperature for token-adaptive scale routing")
+    parser.add_argument("--mixed_precision", action="store_true", help="enable heuristic sensitivity-guided mixed precision for QuantLinear weights")
+    parser.add_argument("--mp_high_bits", type=int, default=6, help="bitwidth for protected/sensitive modules under mixed precision")
+    parser.add_argument("--mp_low_bits", type=int, default=None, help="bitwidth for non-protected modules under mixed precision; defaults to --wbits")
+    parser.add_argument("--mp_protect_modules", type=str, default="q_proj,k_proj,v_proj,o_proj,up_proj,gate_proj", help="comma-separated module names to protect with high bits")
+    parser.add_argument("--mp_protect_layers", type=str, default="first,last", help="comma-separated protected layer ids or first,last")
+    parser.add_argument("--quantize_vit", action="store_true", help="experimental: fake-quantize vision tower Linear layers for end-to-end MLLM quantization")
+    parser.add_argument("--vit_wbits", type=int, default=8, help="vision tower weight bits when --quantize_vit is enabled")
+    parser.add_argument("--vit_abits", type=int, default=8, help="vision tower activation bits when --quantize_vit is enabled")
     parser.add_argument("--ppl_result", default="ppl_result.csv")
     parser.add_argument("--eval_sqnr", action="store_true")
     parser.add_argument("--sqnr_result", default="sqnr_result.csv")
@@ -642,6 +714,9 @@ def main_entry(args=None):
         args = parser.parse_args()
     else:
         args = parser.parse_args(args)
+
+    os.environ["MASQ_ADAPTIVE_MODAL_SCALE"] = "1" if args.adaptive_modal_scale else "0"
+    os.environ["MASQ_ADAPTIVE_SCALE_TAU"] = str(args.adaptive_scale_tau)
   
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -740,6 +815,8 @@ def main_entry(args=None):
         args.act_scales = f'./act_scales/{args.net}-{args.dataset_type}-{args.nsamples}.pt'
     if args.act_shifts is None:
         args.act_shifts = f'./act_shifts/{args.net}-{args.dataset_type}.pt'
+
+    quantize_vision_tower_if_requested(llm.model, args, logger)
 
     # quantization
     if args.wbits < 16 or args.abits <16:

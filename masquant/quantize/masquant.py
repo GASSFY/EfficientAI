@@ -110,6 +110,83 @@ def check_gradient(model):
                 return False
     return True
 
+
+def _parse_protected_layers(spec, num_layers):
+    protected = set()
+    for item in str(spec).split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item == 'first':
+            protected.add(0)
+        elif item == 'last':
+            protected.add(num_layers - 1)
+        elif item.isdigit():
+            protected.add(int(item))
+    return protected
+
+
+def apply_mixed_precision_policy(qlayer, args, layer_idx, num_layers):
+    if not getattr(args, 'mixed_precision', False):
+        return
+    low_bits = args.mp_low_bits if args.mp_low_bits is not None else args.wbits
+    high_bits = args.mp_high_bits
+    protected_layers = _parse_protected_layers(args.mp_protect_layers, num_layers)
+    protected_modules = {m.strip() for m in args.mp_protect_modules.split(',') if m.strip()}
+    for name, module in qlayer.named_modules():
+        if isinstance(module, QuantLinear):
+            is_protected_module = any(key in name for key in protected_modules)
+            bits = high_bits if (layer_idx in protected_layers or is_protected_module) else low_bits
+            module.weight_quantizer.change_n_bits(bits)
+
+
+def _masked_mean(value, mask):
+    denom = mask.sum().clamp(min=1)
+    return (value * mask).sum() / denom
+
+
+def sensitivity_aware_modal_loss(
+    quant_out,
+    fp_out,
+    multi_modal_mask,
+    tau=0.05,
+    auto_weight=False,
+    grad_info=None,
+    layer_idx=0,
+):
+    audio_mask, image_mask, text_mask = multi_modal_mask
+    diff = (quant_out - fp_out).abs()
+    modal_losses = []
+    modal_names = []
+    text_loss = _masked_mean(diff, text_mask)
+    modal_losses.append(text_loss)
+    modal_names.append('text')
+    if image_mask is not None and image_mask.any():
+        modal_losses.append(_masked_mean(diff, image_mask))
+        modal_names.append('vision')
+    if audio_mask is not None and audio_mask.any():
+        modal_losses.append(_masked_mean(diff, audio_mask))
+        modal_names.append('audio')
+
+    losses = torch.stack(modal_losses)
+    if auto_weight:
+        weights = torch.softmax(losses.detach() / max(tau, 1e-6), dim=0) * len(modal_losses)
+    else:
+        weights = torch.ones_like(losses)
+        for idx, name in enumerate(modal_names):
+            if name == 'vision':
+                weights[idx] = 0.5
+                if grad_info is not None:
+                    weights[idx] = 0.126
+            elif name == 'audio':
+                weights[idx] = 1.0
+                if grad_info is not None:
+                    weights[idx] = (
+                        grad_info[f'layers.{layer_idx}']['aud_avg_grad']
+                        / grad_info[f'layers.{layer_idx}']['cap_avg_grad']
+                    )
+    return (weights.to(losses.device) * losses).mean()
+
 def masquant(
     lm,
     args,
@@ -641,6 +718,7 @@ def masquant(
                 # LlavaQwen: language config fields live on the root config
                 qlayer = DecoderLayer(model.config, layer, args, layer_idx=i)
         qlayer = qlayer.to(dev)
+        apply_mixed_precision_policy(qlayer, args, i, len(layers))
 
         # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
@@ -823,38 +901,49 @@ def masquant(
                             
                             total_mask = (text_mask.sum() + audio_mask.sum() + image_mask.sum())
                             loss = (text_diff.sum() + audio_diff.sum() + vision_diff.sum()) / total_mask
-                        elif args.loss_multi_modal_mae_alpha: 
-                            quant_diff = (quant_out-fp_tgt).abs()
-                            text_diff = quant_diff*text_mask
-                            total_mask = text_mask.sum()
-                            
-                            if audio_mask is not None:
-                                audio_diff = quant_diff*audio_mask
-                                total_mask += audio_mask.sum()
-                                audio_grad = 1.0
-                                if grad_info is not None:
-                                    # 这个是实际通过 MBQ 的梯度信息去读取的，实际发现，效果并不好，不如取所有 layer中的 max 梯度作为各层的梯度的值，所以这个0.5478636880998574是 qwen2.5-omni-3b 的值.
-                                    audio_grad = grad_info[f'layers.{i}']['aud_avg_grad'] / grad_info[f'layers.{i}']['cap_avg_grad']
-                                    # audio_grad = 0.5478636880998574
-                                audio_diff = audio_grad * audio_diff
-                                
-                            if image_mask is not None:
-                                vision_diff = quant_diff*image_mask
-                                total_mask += image_mask.sum()
-                                # 针对 qwen-omni 模型，这个 0.5 是瞎猜的,  text : audio : vision = 1 : 1 : 0.5 
-                                vision_grad = 0.5
-                                if grad_info is not None:
-                                    # 这个 0.14992747247178426 的意义同audio_grad
-                                    # 针对 qwen-vl-3b 模型，这个0.126 是通过 MBQ 进行 per-layer梯度信息采集得到的 0.12593715319890053. text: vision = 1: 0.126
-                                    # 针对qwen-vl-7b 0.11022980689742588，接近于 0.11
-                                    vision_grad = grad_info[f'layers.{i}']['vis_avg_grad'] / grad_info[f'layers.{i}']['cap_avg_grad']
-                                    # vision_grad = 0.14992747247178426
-                                    vision_grad = 0.126
-                                vision_diff = vision_grad * vision_diff
-                            if audio_mask is not None and image_mask is not None:
-                                loss = (text_diff.sum() + audio_diff.sum() + vision_diff.sum()) / total_mask
+                        elif args.loss_multi_modal_mae_alpha:
+                            if getattr(args, 'auto_modal_weight', False):
+                                loss = sensitivity_aware_modal_loss(
+                                    quant_out,
+                                    fp_tgt,
+                                    (audio_mask, image_mask, text_mask),
+                                    tau=getattr(args, 'modal_weight_tau', 0.05),
+                                    auto_weight=True,
+                                    grad_info=grad_info,
+                                    layer_idx=i,
+                                )
                             else:
-                                loss = (text_diff.sum() + vision_diff.sum()) / total_mask
+                                quant_diff = (quant_out-fp_tgt).abs()
+                                text_diff = quant_diff*text_mask
+                                total_mask = text_mask.sum()
+                                
+                                if audio_mask is not None:
+                                    audio_diff = quant_diff*audio_mask
+                                    total_mask += audio_mask.sum()
+                                    audio_grad = 1.0
+                                    if grad_info is not None:
+                                        # 这个是实际通过 MBQ 的梯度信息去读取的，实际发现，效果并不好，不如取所有 layer中的 max 梯度作为各层的梯度的值，所以这个0.5478636880998574是 qwen2.5-omni-3b 的值.
+                                        audio_grad = grad_info[f'layers.{i}']['aud_avg_grad'] / grad_info[f'layers.{i}']['cap_avg_grad']
+                                        # audio_grad = 0.5478636880998574
+                                    audio_diff = audio_grad * audio_diff
+                                    
+                                if image_mask is not None:
+                                    vision_diff = quant_diff*image_mask
+                                    total_mask += image_mask.sum()
+                                    # 针对 qwen-omni 模型，这个 0.5 是瞎猜的,  text : audio : vision = 1 : 1 : 0.5 
+                                    vision_grad = 0.5
+                                    if grad_info is not None:
+                                        # 这个 0.14992747247178426 的意义同audio_grad
+                                        # 针对 qwen-vl-3b 模型，这个0.126 是通过 MBQ 进行 per-layer梯度信息采集得到的 0.12593715319890053. text: vision = 1: 0.126
+                                        # 针对qwen-vl-7b 0.11022980689742588，接近于 0.11
+                                        vision_grad = grad_info[f'layers.{i}']['vis_avg_grad'] / grad_info[f'layers.{i}']['cap_avg_grad']
+                                        # vision_grad = 0.14992747247178426
+                                        vision_grad = 0.126
+                                    vision_diff = vision_grad * vision_diff
+                                if audio_mask is not None and image_mask is not None:
+                                    loss = (text_diff.sum() + audio_diff.sum() + vision_diff.sum()) / total_mask
+                                else:
+                                    loss = (text_diff.sum() + vision_diff.sum()) / total_mask
                         else:
                             loss = loss_func(fp_tgt.to(torch.float32), quant_out.to(torch.float32))
                         if args.aug_loss:

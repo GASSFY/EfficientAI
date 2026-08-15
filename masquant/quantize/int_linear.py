@@ -86,6 +86,9 @@ class QuantLinear(nn.Module):
         #     print(f'统一 scale')
         #区分是infer模式还是train模式
         self.mode = mode
+        # AdaMAS: soft-mix modality smooth scales (env set from --adaptive_modal_scale)
+        self.adaptive_modal_scale = os.getenv("MASQ_ADAPTIVE_MODAL_SCALE", "0") == "1"
+        self.adaptive_scale_tau = float(os.getenv("MASQ_ADAPTIVE_SCALE_TAU", "1.0"))
 
     def get_masked_value(self, mask_value, input_tensor):
         if mask_value is None:
@@ -118,6 +121,44 @@ class QuantLinear(nn.Module):
 
         # 返回索引和对应的值
         return indices, tensor1[indices], tensor2[indices]
+
+    def _forward_adaptive_split(self, input, audio_mask, image_mask, text_mask, target_dtype, cur_dtype, epsilon):
+        # Softly route each token among modality-specific smooth scales. This keeps
+        # the original modality-aware scales but avoids a hard assignment for tokens
+        # whose activation statistics look closer to another modality.
+        scales = []
+        scales.append(self.text_smooth_scale + epsilon)
+        if image_mask is not None and image_mask.any():
+            scales.append(self.vision_smooth_scale + epsilon)
+        if audio_mask is not None and audio_mask.any():
+            scales.append(self.audio_smooth_scale + epsilon)
+
+        logits = []
+        input_bf16 = input.to(target_dtype)
+        for scale in scales:
+            normalized = input_bf16 / scale
+            logits.append(-normalized.abs().mean(dim=-1, keepdim=True) / max(self.adaptive_scale_tau, 1e-6))
+        gates = torch.softmax(torch.cat(logits, dim=-1), dim=-1).to(cur_dtype)
+
+        outputs = []
+        for scale in scales:
+            if self.use_weight_quant:
+                weight_scaled = self.weight_quantizer((self.weight.to(target_dtype) * scale).to(cur_dtype))
+            else:
+                weight_scaled = (self.weight.to(target_dtype) * scale).to(cur_dtype)
+            if self.use_act_quant and not self.disable_input_quant:
+                input_scaled = self.act_quantizer((input_bf16 / scale).to(cur_dtype))
+            else:
+                input_scaled = (input_bf16 / scale).to(cur_dtype)
+            outputs.append(self.fwd_func(input_scaled, weight_scaled, bias=None))
+
+        out = torch.zeros_like(outputs[0])
+        for idx, modal_out in enumerate(outputs):
+            bias = self.bias.to(cur_dtype) if (idx == 0 and self.bias is not None) else None
+            if bias is not None:
+                modal_out = modal_out + bias
+            out = out + modal_out * gates[..., idx:idx + 1]
+        return out.to(cur_dtype)
 
     def forward_mas_train(self, input: torch.Tensor, multi_modal_mask=None):
         cur_dtype = input.dtype
@@ -171,6 +212,10 @@ class QuantLinear(nn.Module):
 
         # 分模态scale（恢复为过夜 InternVL 成功时的并行路径；不做 ±1e4 / abs 强制）
         else:
+            if self.adaptive_modal_scale:
+                return self._forward_adaptive_split(
+                    input, audio_mask, image_mask, text_mask, target_dtype, cur_dtype, epsilon
+                )
             if self.use_weight_quant:
                 weight_audio = self.weight_quantizer(
                     (self.weight.to(target_dtype) * self.audio_smooth_scale).to(cur_dtype))
